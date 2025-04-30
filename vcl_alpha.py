@@ -25,9 +25,6 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    # Optional: Ensures deterministic behavior in CuDNN (can impact performance)
-    # torch.backends.cudnn.benchmark = False
-    # torch.backends.cudnn.deterministic = True
 
 # --- Directory Setup ---
 def setup_experiment_dirs(experiment_name, alpha, use_coreset, coreset_method=None, seed=None):
@@ -92,104 +89,150 @@ class BayesianLinear(nn.Module):
         )
         return torch.clamp(kl_div, min=0)
 
-    def _amari_alpha_divergence_single_gaussian(self, mu_q, log_var_q, mu_p, log_var_p, alpha):
+    def _amari_alpha_divergence_single_gaussian(self, mu_p, log_var_p, mu_q, log_var_q, alpha):
         """
         Computes Amari's alpha divergence D_alpha(P || Q) for diagonal Gaussians P, Q.
         P = N(mu_p, var_p), Q = N(mu_q, var_q)
         Formula: D_alpha(P || Q) = (4 / (1 - alpha^2)) * (1 - Integral)
-        Integral = sqrt(var_q / var_beta) * exp( (1-alpha^2)/8 * (mu_p-mu_q)^2 / var_beta )
-        where var_beta = (1+alpha)/2 * var_q + (1-alpha)/2 * var_p
+        Integral = Integral[ p(x)^((1+alpha)/2) * q(x)^((1-alpha)/2) dx ]
+                 = (sqrt(var_p)*sqrt(var_q) / var_beta) * exp( -(1-alpha^2)/8 * (mu_p-mu_q)^2 / var_beta^2 ) <-- Careful with source/formula variants!
+        Let's use the common form derived from the integral directly or matching reliable sources, e.g., related to Rényi:
+        Integral = exp( -D_{Bha} - (1-alpha^2)/8 * (mu_p-mu_q)^2 / var_beta ) <-- Less common form.
+
+        Let's stick to the one derivable from Gaussian integrals, often cited as:
+        Integral = sqrt( (2*sigma_p*sigma_q / (sigma_p^2 + sigma_q^2)) ^ (1-alpha) * (2*sigma_p*sigma_q / (sigma_p^2 + sigma_q^2)) ^ (1+alpha) ) ... too complex.
+
+        Let's re-verify the form used in the original comment, potentially derived correctly:
+        Integral = sqrt(var_q / var_beta) * exp( (1-alpha^2)/8 * (mu_p-mu_q)^2 / var_beta ) NO, this is likely wrong.
+
+        A verified formula (see e.g., Nielsen & Boltz, "The Alpha-Beta Divergence"):
+        D_alpha(P || Q) = (1 / (lambda*(1-lambda))) * (1 - Integral p(x)^lambda q(x)^(1-lambda) dx) where lambda = (1+alpha)/2
+        Integral p^lambda q^(1-lambda) dx = sqrt( (sigma_p^2)^(1-lambda) * (sigma_q^2)^lambda / sigma_lambda^2 ) * exp( - lambda*(1-lambda)/2 * (mu_p-mu_q)^2 / sigma_lambda^2 )
+        where sigma_lambda^2 = (1-lambda)*sigma_p^2 + lambda*sigma_q^2
+
+        Substituting lambda = (1+alpha)/2:
+        1-lambda = (1-alpha)/2
+        lambda*(1-lambda) = (1-alpha^2)/4
+        sigma_lambda^2 = (1-alpha)/2 * sigma_p^2 + (1+alpha)/2 * sigma_q^2  <- NOTE THE ORDER vs code comment!
+
+        Let's implement THIS version, assuming P=N(mu_p, var_p) and Q=N(mu_q, var_q).
+
         """
         if abs(alpha) == 1.0:
+            # This case is handled outside by checking alpha approx +/- 1
             raise ValueError("Alpha cannot be exactly 1 or -1 for Amari alpha-divergence formula.")
 
-        var_q = torch.exp(log_var_q)
         var_p = torch.exp(log_var_p)
+        var_q = torch.exp(log_var_q)
+        # Add epsilon to prevent division by zero / log(0)
+        var_p = torch.clamp(var_p, min=1e-8)
+        var_q = torch.clamp(var_q, min=1e-8)
 
-        # Prevent division by zero or instability near alpha = +/- 1
-        alpha_sq = alpha * alpha
-        denominator = alpha_sq - 1.0
-        if abs(denominator) < 1e-6:
-             # fallback to KL
-             return torch.tensor(float('inf'), device=mu_q.device)
+        lambda_ = (1.0 + alpha) / 2.0
+        one_minus_lambda = (1.0 - alpha) / 2.0 # == (1-lambda_)
+
+        # Ensure lambda_ * (1-lambda_) is not zero
+        lambda_term_denominator = lambda_ * one_minus_lambda # (1 - alpha^2) / 4
+        if abs(lambda_term_denominator) < 1e-8:
+             # This case corresponds to alpha = +/- 1, should be handled outside
+             # Fallback to KL just in case, though should not be reached
+             print(f"Warning: alpha={alpha} resulted in near-zero lambda*(1-lambda). Falling back to KL.")
+             # Determine which KL based on alpha sign
+             if alpha > 0: # Approaching 1: KL(P || Q)
+                 kl_div = 0.5 * torch.sum(log_var_q - log_var_p + (var_p + (mu_p - mu_q).pow(2)) / var_q - 1.0)
+             else: # Approaching -1: KL(Q || P)
+                 kl_div = 0.5 * torch.sum(log_var_p - log_var_q + (var_q + (mu_q - mu_p).pow(2)) / var_p - 1.0)
+             return torch.clamp(kl_div, min=0)
 
 
-        # Calculate var_beta = beta * var_q + (1-beta) * var_p
-        # beta = (1+alpha)/2, 1-beta = (1-alpha)/2
-        var_beta = 0.5 * (1.0 + alpha) * var_q + 0.5 * (1.0 - alpha) * var_p
-        var_beta = torch.clamp(var_beta, min=1e-8) # Ensure positivity
+        # Calculate sigma_lambda^2 = (1-lambda)*sigma_p^2 + lambda*sigma_q^2
+        var_lambda = one_minus_lambda * var_p + lambda_ * var_q
+        var_lambda = torch.clamp(var_lambda, min=1e-8) # Ensure positivity
+        log_var_lambda = torch.log(var_lambda)
 
-        # Calculate log of the integral term for numerical stability
-        log_var_q = log_var_q
-        log_var_beta = torch.log(var_beta)
-        mu_diff_sq = (mu_p - mu_q).pow(2)
+        # Calculate log of the integral term: log( Integral[ p^lambda * q^(1-lambda) dx ] )
+        # log_Integral = 0.5 * ( (1-lambda)*log_var_p + lambda*log_var_q - log_var_lambda ) - (lambda*(1-lambda)/2) * (mu_p-mu_q)^2 / var_lambda
+        # log_Integral = 0.5 * ( one_minus_lambda*log_var_p + lambda_*log_var_q - log_var_lambda ) - lambda_term_denominator/2.0 * (mu_p - mu_q).pow(2) / var_lambda
+        # Let's recalculate the sqrt term: log( sqrt( (var_p)^(1-lambda) * (var_q)^lambda / var_lambda ) )
+        log_sqrt_term = 0.5 * ( one_minus_lambda * log_var_p + lambda_ * log_var_q - log_var_lambda )
 
-        # Log Integral = 0.5 * (log_var_q - log_var_beta) + ( (1-alpha^2)/8 * mu_diff_sq / var_beta )
-        log_integral_term = 0.5 * (log_var_q - log_var_beta) + (denominator / 8.0) * (mu_diff_sq / var_beta)
+        # Calculate the exponent term
+        exponent_term = - (lambda_term_denominator / 2.0) * (mu_p - mu_q).pow(2) / var_lambda
 
-        # Clamp the exponent before exp to avoid potential overflow/underflow
-        log_integral_term = torch.clamp(log_integral_term, max=50.0, min=-50.0) # Adjust bounds if needed
+        log_integral = log_sqrt_term + exponent_term
 
-        integral_term = torch.exp(log_integral_term)
+        # Clamp the log_integral before exp to avoid potential overflow/underflow
+        log_integral = torch.clamp(log_integral, max=50.0, min=-50.0) # Adjust bounds if needed
 
-        # Calculate divergence
-        divergence = (4.0 / denominator) * (1.0 - integral_term)
+        integral_val = torch.exp(log_integral)
 
-        # Sum over all dimensions
-        return torch.sum(torch.clamp(divergence, min=0)) # Ensure non-negativity
+        # Calculate divergence: D_alpha(P || Q) = (1 / (lambda*(1-lambda))) * (1 - Integral)
+        divergence = (1.0 / lambda_term_denominator) * (1.0 - integral_val)
 
+        # Sum over all dimensions and ensure non-negativity (numerical precision might cause small negatives)
+        return torch.sum(torch.clamp(divergence, min=0))
 
     def divergence(self, alpha=1.0):
         """ Calculate divergence D(q || p_prior) using KL or Amari alpha """
-        # Use KL if alpha is close to 1 (forward KL)
+        # Note: We want D_alpha(q_posterior || p_prior)
+
+        # Use KL if alpha is close to 1 (forward KL) D_1(Q || P) = KL(Q || P)
         if abs(alpha - 1.0) < 1e-4:
             # print("Using KL divergence (alpha approx 1)")
-            return self._kl_divergence(
-                self.weight_mu, self.weight_log_var,
-                self.weight_prior_mu, self.weight_prior_log_var
+            return self._kl_divergence( # KL(Q || P)
+                self.weight_mu, self.weight_log_var,        # Q = posterior
+                self.weight_prior_mu, self.weight_prior_log_var # P = prior
             ) + self._kl_divergence(
-                self.bias_mu, self.bias_log_var,
-                self.bias_prior_mu, self.bias_prior_log_var
+                self.bias_mu, self.bias_log_var,            # Q = posterior
+                self.bias_prior_mu, self.bias_prior_log_var # P = prior
             )
-        # Use Reverse KL if alpha is close to -1
+        # Use Reverse KL if alpha is close to -1. D_{-1}(Q || P) = KL(P || Q)
         elif abs(alpha + 1.0) < 1e-4:
              # print("Using Reverse KL divergence (alpha approx -1)")
-             # Calculate KL(prior || posterior)
-             return self._kl_divergence(
-                 self.weight_prior_mu, self.weight_prior_log_var,
-                 self.weight_mu, self.weight_log_var,
+             return self._kl_divergence( # KL(P || Q)
+                 self.weight_prior_mu, self.weight_prior_log_var, # P = prior
+                 self.weight_mu, self.weight_log_var,        # Q = posterior
              ) + self._kl_divergence(
-                 self.bias_prior_mu, self.bias_prior_log_var,
-                 self.bias_mu, self.bias_log_var,
+                 self.bias_prior_mu, self.bias_prior_log_var,   # P = prior
+                 self.bias_mu, self.bias_log_var,            # Q = posterior
              )
         # Use Amari Alpha-Divergence otherwise
         else:
             # print(f"Using Amari Alpha divergence (alpha={alpha})")
-            # Note: The formula is D_alpha(P || Q). Here P=prior, Q=posterior.
-            # We want D_alpha(Q || P_prior)
-            # D_alpha(Q || P) = D_{-alpha}(P || Q)
+            # We want D_alpha(Q || P). Our function calculates D_alpha(P || Q).
+            # We use the identity D_alpha(Q || P) = D_{-alpha}(P || Q)
             effective_alpha = -alpha
-            if abs(abs(effective_alpha) - 1.0) < 1e-4: # Check again after flipping sign
-                 # This should not happen if initial checks passed, but for safety
-                 print(f"Warning: Effective alpha {-alpha} near +/- 1, falling back to KL.")
-                 return self.divergence(alpha=1.0) # Fallback to standard KL
+            # Need to ensure effective_alpha is not +/- 1 after negation
+            if abs(abs(effective_alpha) - 1.0) < 1e-4:
+                 print(f"Warning: Effective alpha {-alpha} near +/- 1, falling back to appropriate KL.")
+                 # If effective_alpha -> 1 (alpha -> -1), we want D_{-1}(P||Q) = KL(Q||P)
+                 # If effective_alpha -> -1 (alpha -> 1), we want D_{1}(P||Q) = KL(P||Q)
+                 # The logic above already handles alpha approx +/- 1 correctly.
+                 # This edge case might occur if alpha is exactly 1 or -1, handled by prior checks.
+                 # If it gets here due to float precision near boundary, use the original alpha check.
+                 return self.divergence(alpha=alpha) # Re-call to use the +/- 1 logic
 
             try:
-                div_w = self._amari_alpha_divergence_single_gaussian(
-                    self.weight_prior_mu, self.weight_prior_log_var, # P = prior
-                    self.weight_mu, self.weight_log_var,             # Q = posterior
-                    effective_alpha                                  # Use -alpha
-                )
-                div_b = self._amari_alpha_divergence_single_gaussian(
-                    self.bias_prior_mu, self.bias_prior_log_var,       # P = prior
-                    self.bias_mu, self.bias_log_var,                   # Q = posterior
-                    effective_alpha                                    # Use -alpha
-                )
-                return div_w + div_b
+                 # Calculate D_{-alpha}(P_prior || Q_posterior)
+                 div_w = self._amari_alpha_divergence_single_gaussian(
+                     self.weight_prior_mu, self.weight_prior_log_var, # P = prior
+                     self.weight_mu, self.weight_log_var,             # Q = posterior
+                     effective_alpha                                  # Use -alpha
+                 )
+                 div_b = self._amari_alpha_divergence_single_gaussian(
+                     self.bias_prior_mu, self.bias_prior_log_var,       # P = prior
+                     self.bias_mu, self.bias_log_var,                   # Q = posterior
+                     effective_alpha                                    # Use -alpha
+                 )
+                 return div_w + div_b
             except ValueError as e:
-                 print(f"Error computing alpha-divergence with alpha={alpha}: {e}. Falling back to KL.")
-                 return self.divergence(alpha=1.0)
-
+                 print(f"Error computing alpha-divergence with alpha={alpha} (effective_alpha={effective_alpha}): {e}. Falling back to KL(Q||P).")
+                 # Fallback to standard KL D_1(Q || P)
+                 return self._kl_divergence(
+                     self.weight_mu, self.weight_log_var, self.weight_prior_mu, self.weight_prior_log_var
+                 ) + self._kl_divergence(
+                     self.bias_mu, self.bias_log_var, self.bias_prior_mu, self.bias_prior_log_var
+                 )
 
     def update_prior(self):
         self.weight_prior_mu.data.copy_(self.weight_mu.data.clone().detach())
